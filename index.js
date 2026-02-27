@@ -18,7 +18,7 @@ app.post("/identify", async (req, res) => {
   }
 
   try {
-    // 1️⃣ Find all direct matches
+    // 1️⃣ Find direct matches
     const directMatches = await prisma.contact.findMany({
       where: {
         OR: [
@@ -28,7 +28,7 @@ app.post("/identify", async (req, res) => {
       },
     });
 
-    // 2️⃣ If no matches → create new primary
+    // 2️⃣ No matches → create primary
     if (directMatches.length === 0) {
       const newContact = await prisma.contact.create({
         data: {
@@ -48,18 +48,18 @@ app.post("/identify", async (req, res) => {
       });
     }
 
-    // 3️⃣ Collect all related primary IDs
-    let primaryIds = new Set();
+    // 3️⃣ Collect all primary IDs
+    const primaryIds = new Set();
 
     for (let contact of directMatches) {
       if (contact.linkPrecedence === "primary") {
         primaryIds.add(contact.id);
-      } else {
+      } else if (contact.linkedId) {
         primaryIds.add(contact.linkedId);
       }
     }
 
-    // 4️⃣ Fetch full cluster of all related contacts
+    // 4️⃣ Fetch full cluster
     const allRelated = await prisma.contact.findMany({
       where: {
         OR: [
@@ -69,14 +69,18 @@ app.post("/identify", async (req, res) => {
       },
     });
 
-    // 5️⃣ Determine oldest primary
-    let primary = allRelated.reduce((oldest, current) =>
+    // 5️⃣ Determine oldest PRIMARY only
+    const primaryContacts = allRelated.filter(
+      c => c.linkPrecedence === "primary"
+    );
+
+    let primary = primaryContacts.reduce((oldest, current) =>
       oldest.id < current.id ? oldest : current
     );
 
     // 6️⃣ Convert other primaries to secondary
-    for (let contact of allRelated) {
-      if (contact.id !== primary.id && contact.linkPrecedence === "primary") {
+    for (let contact of primaryContacts) {
+      if (contact.id !== primary.id) {
         await prisma.contact.update({
           where: { id: contact.id },
           data: {
@@ -87,16 +91,24 @@ app.post("/identify", async (req, res) => {
       }
     }
 
-    // 7️⃣ Check if incoming info is new
-    const emailExists = await prisma.contact.findFirst({
-      where: { email },
+    // 7️⃣ Refresh cluster after merge
+    const updatedCluster = await prisma.contact.findMany({
+      where: {
+        OR: [
+          { id: primary.id },
+          { linkedId: primary.id },
+        ],
+      },
     });
 
-    const phoneExists = await prisma.contact.findFirst({
-      where: { phoneNumber },
-    });
+    const existingEmails = updatedCluster.map(c => c.email);
+    const existingPhones = updatedCluster.map(c => c.phoneNumber);
 
-    if (!emailExists || !phoneExists) {
+    const isNewEmail = email && !existingEmails.includes(email);
+    const isNewPhone = phoneNumber && !existingPhones.includes(phoneNumber);
+
+    // 8️⃣ Create secondary ONLY if new info
+    if (isNewEmail || isNewPhone) {
       await prisma.contact.create({
         data: {
           email: email || null,
@@ -107,7 +119,7 @@ app.post("/identify", async (req, res) => {
       });
     }
 
-    // 8️⃣ Fetch final cluster
+    // 9️⃣ Final cluster
     const finalCluster = await prisma.contact.findMany({
       where: {
         OR: [
@@ -150,4 +162,10 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+// Graceful shutdown (important for Railway)
+process.on("SIGTERM", async () => {
+  await prisma.$disconnect();
+  process.exit(0);
 });
